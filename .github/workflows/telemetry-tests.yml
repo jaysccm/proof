@@ -1,0 +1,16 @@
+name: telemetry tests
+on:
+  pull_request:
+    paths: ["generator/telemetry.js", "proof.sh", "tests/**", ".github/workflows/telemetry-tests.yml"]
+permissions:
+  contents: read
+jobs:
+  telemetry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test tests/telemetry.test.js
+      - run: bash tests/telemetry-pipeline.sh

@@ -263,7 +263,58 @@ if [ -z "$REPO" ]; then
 fi
 
 TMP="$(mktemp -d)"
-cleanup() { [ "$KEEP_TMP" = 1 ] || rm -rf "$TMP"; }
+
+# --- opt-in telemetry (default OFF) --------------------------------------------
+# Enabled only by PROOF_TELEMETRY=1 plus PROOF_TELEMETRY_ENDPOINT (a private OTLP/HTTP
+# base URL; generator/telemetry.js refuses public hosts). It records bounded enums and
+# durations only: backend, outcome, stage, check. No PR numbers/titles/bodies/diffs,
+# repo names or URLs. Export runs detached after the pipeline and can never change the
+# exit status or delay it. See docs/telemetry.md.
+TEL=0
+if [ "${PROOF_TELEMETRY:-}" = "1" ] && [ -n "${PROOF_TELEMETRY_ENDPOINT:-}" ]; then TEL=1; fi
+TEL_STAGES=(); TEL_CHECKS=(); TEL_REASON=""; TEL_STAGE=""; TEL_T0=""
+TEL_RUN0="$(date +%s.%N)"
+tel_end() {
+  [ "$TEL" = 1 ] || return 0
+  if [ -n "$TEL_STAGE" ]; then
+    TEL_STAGES+=("$TEL_STAGE:$(awk -v a="$TEL_T0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.3f", b-a}'):$1")
+    TEL_STAGE=""
+  fi
+}
+tel_begin() { [ "$TEL" = 1 ] || return 0; tel_end ok; TEL_STAGE="$1"; TEL_T0="$(date +%s.%N)"; }
+tel_check() { [ "$TEL" = 1 ] || return 0; TEL_CHECKS+=("$1:$2"); }
+tel_finish() {
+  [ "$TEL" = 1 ] || return 0
+  local rc="$1" outcome="success" stage="$TEL_STAGE"
+  if [ "$rc" -ne 0 ]; then
+    tel_end error
+    case "${TEL_REASON:-$stage}" in
+      backend_failure|invalid_output) outcome="${TEL_REASON:-$stage}" ;;
+      validate) outcome="validation_failed" ;;
+      render) outcome="render_failed"; tel_check render fail ;;
+      *) outcome="error" ;;
+    esac
+  else
+    tel_end ok
+  fi
+  TEL_STAGES+=("total:$(awk -v a="$TEL_RUN0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.3f", b-a}'):$([ "$rc" -eq 0 ] && echo ok || echo error)")
+  local backend="${BACKEND:-none}"
+  if [ -n "$DATA" ]; then backend=injected; fi
+  local args=(--backend "$backend" --outcome "$outcome") x
+  for x in "${TEL_STAGES[@]}"; do args+=(--stage "$x"); done
+  for x in "${TEL_CHECKS[@]}"; do args+=(--check "$x"); done
+  if [ "${PROOF_TELEMETRY_SYNC:-}" = "1" ]; then
+    node "$HERE/generator/telemetry.js" record "${args[@]}" >/dev/null 2>&1 || true
+  else
+    ( node "$HERE/generator/telemetry.js" record "${args[@]}" >/dev/null 2>&1 </dev/null & ) 2>/dev/null || true
+  fi
+  return 0
+}
+cleanup() {
+  local rc=$?
+  tel_finish "$rc" || true
+  [ "$KEEP_TMP" = 1 ] || rm -rf "$TMP"
+}
 trap cleanup EXIT
 [ "$KEEP_TMP" = 1 ] && echo "· tmp: $TMP"
 
@@ -273,6 +324,7 @@ DIFF_PATCH="$TMP/pr-$PR.diff"
 META_JSON="$TMP/pr-$PR.meta.json"
 
 # --- 1. gather ----------------------------------------------------------------
+tel_begin gather
 echo "· [1/5] gather — PR #$PR in $REPO"
 gh pr view "$PR" --repo "$REPO" \
   --json number,title,body,headRefName,baseRefName,headRefOid,baseRefOid \
@@ -300,6 +352,7 @@ INPUTS_TXT="$TMP/pr-$PR.inputs.txt"
 } > "$INPUTS_TXT"
 
 # --- 2. generate --------------------------------------------------------------
+tel_begin generate
 if [ -n "$DATA" ]; then
   echo "· [2/5] generate — bypassed, using $DATA"
   [ -r "$DATA" ] || { echo "❌ --data file not readable: $DATA" >&2; exit 2; }
@@ -365,6 +418,7 @@ else
       if [ ! -s "$RESP" ]; then
         echo "❌ bedrock returned no response — likely auth, region, or model-access failure:" >&2
         cat "$TMP/aws-stderr.txt" >&2
+        TEL_REASON=backend_failure
         exit 3
       fi
 
@@ -372,6 +426,7 @@ else
       # misleading message, so name the real cause here.
       if [ "$(jq -r '.stop_reason // ""' "$RESP")" = "max_tokens" ]; then
         echo "❌ model hit max_tokens ($MAX_TOKENS) — output truncated. Raise --max-tokens." >&2
+        TEL_REASON=backend_failure
         exit 3
       fi
 
@@ -402,6 +457,7 @@ else
       if [ ! -s "$RESP" ]; then
         echo "❌ opencode returned no response — likely auth or model-access failure:" >&2
         cat "$ERR" >&2
+        TEL_REASON=backend_failure
         exit 3
       fi
 
@@ -413,6 +469,7 @@ else
 
   if ! jq empty "$DATA_JSON" 2>/dev/null || [ ! -s "$DATA_JSON" ]; then
     echo "❌ generation did not produce valid JSON (see stderr above)." >&2
+    TEL_REASON=invalid_output
     exit 3
   fi
 fi
@@ -424,22 +481,38 @@ jq --arg n "$PR" --arg t "$TITLE" --arg r "$REPO" --arg h "$HEAD_SHA" --arg b "$
   "$DATA_JSON" > "$DATA_JSON.tmp" && mv "$DATA_JSON.tmp" "$DATA_JSON"
 
 # --- 3. ingest diff -----------------------------------------------------------
+tel_begin ingest
 echo "· [3/5] ingest — attribute diff lines to decisions"
 node "$HERE/generator/ingest-diff.js" "$DATA_JSON" "$DIFF_PATCH"
 
 # --- 4. validate --------------------------------------------------------------
+tel_begin validate
 echo "· [4/5] validate — provenance + evidence + coverage"
 if ! node "$HERE/validate.js" "$DATA_JSON" --inputs "$INPUTS_TXT"; then
+  tel_check validate fail
   echo
   echo "❌ validation failed — not rendering. Fix the data/prompt and re-run." >&2
   # In CI this stdout becomes the PR comment body (see .github/workflows/proof.yml).
   exit 1
 fi
 
+tel_check validate pass
+
 # --- 5. render ----------------------------------------------------------------
+tel_begin render
 OUT_HTML="$OUT/pr-$PR.html"
 echo "· [5/5] render — $OUT_HTML"
 node "$HERE/generate.js" "$DATA_JSON" "$OUT_HTML"
+if [ "$TEL" = 1 ]; then
+  # Artifact checks, only measured when telemetry is on: the HTML exists and is non-empty, and
+  # rendering the same data again is byte-identical (the repo's own safety net, CLAUDE.md).
+  if [ -s "$OUT_HTML" ]; then tel_check render pass; else tel_check render fail; fi
+  if node "$HERE/generate.js" "$DATA_JSON" "$TMP/regen.html" >/dev/null 2>&1 && cmp -s "$OUT_HTML" "$TMP/regen.html"; then
+    tel_check regeneration_identical pass
+  else
+    tel_check regeneration_identical fail
+  fi
+fi
 
 # Keep the ingested data next to the HTML so a hosted renderer or re-run can use it.
 cp "$DATA_JSON" "$OUT/data/pr-$PR.json" 2>/dev/null || cp "$DATA_JSON" "$OUT/pr-$PR.json"
